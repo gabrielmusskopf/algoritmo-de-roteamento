@@ -71,6 +71,13 @@ echo "=== Habilitando IP Forwarding no Roteador 2 (ns2)... ==="
 sudo ip netns exec ns2 sysctl -w net.ipv4.ip_forward=1
 echo
 
+# --- Adicionar Rota Dummy em R1 ---
+echo "=== Adicionando rede dummy 192.168.2.0/24 ao Roteador 2 (ns1)... ==="
+sudo ip netns exec ns1 ip link add dummy0 type dummy
+sudo ip netns exec ns1 ip link set dev dummy0 up
+sudo ip netns exec ns1 ip addr add 192.168.2.1/24 dev dummy0
+echo
+
 # --- Adicionar Rota Dummy em R3 ---
 echo "=== Adicionando rede dummy 192.168.3.0/24 ao Roteador 3 (ns3)... ==="
 sudo ip netns exec ns3 ip link add dummy0 type dummy

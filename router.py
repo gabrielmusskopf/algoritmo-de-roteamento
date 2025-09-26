@@ -8,6 +8,26 @@ import argparse
 import ipaddress
 import subprocess
 
+# Protocolo:
+# +-------------+-----------+-------+
+# | Versão (1B) | Tipo (1B) | Dados |
+# +-------------+-----------+-------+
+#
+# Os bytes de dados sempre trafegam convertidos com utf-8.
+#
+# Tipos:
+# PACKET_TYPE_UPDATE
+#   Pacote com os dados das rotas que não foram recebidas por essa interface. Dados são
+#   ip,custo,latência separados por ;. Exemplo 192.168.1.0,2,15;10.10.1.0,3,12. Esse pacote instrui
+#   o roteador a atualizar sua tabela de roteamento, se necessário. Não espera nenhuma resposta.
+#
+# PACKET_TYPE_METRIC_PROBE_REQUEST
+#   Pacotes para medição das métricas. Dados são o timestamp. Espera uma resposta
+#   PACKET_TYPE_METRIC_PROBE_REPLY.
+#
+# PACKET_TYPE_METRIC_PROBE_REPLY
+#   Resposta ao pacote de PACKET_TYPE_METRIC_PROBE_REQUEST. Dados são o timestamp atual.
+
 # TODO:
 # Protocolo
 # - [x] Criar tabela de roteamento com as interfaces fisicamente conectadas
@@ -45,6 +65,7 @@ class RouteEntry:
     next_hop: ipaddress.IPv4Address
     metric: int
     outgoing_interface: str
+    latency_ms: float = 0.0
     timestamp: float = field(default_factory=time.time)
 
     def __str__(self):
@@ -66,10 +87,26 @@ class RoutingTable:
         """Adiciona uma nova rota ou atualiza uma existente se a nova for melhor (métrica menor)."""
         with self._lock:
             destination = new_route.destination_network
+            latency_str = "inf" if new_route.latency_ms == float('inf') else f"{1000 * new_route.latency_ms:.2f}ms"
 
-            # Se a rota não existe ou a nova rota tem uma métrica melhor, atualiza.
-            if destination not in self._routes or new_route.metric < self._routes[destination].metric:
-                print(f"[RoutingTable] Updating route to {destination} via {new_route.next_hop}")
+            if destination not in self._routes:
+                print(f"[RoutingTable] Adding route to {destination} via {new_route.next_hop} with metric {new_route.metric} latency {latency_str}")
+                self._routes[destination] = new_route
+                self.add_kernel_route(
+                    destination=str(new_route.destination_network),
+                    gateway=str(new_route.next_hop)
+                )
+
+            elif new_route.metric < self._routes[destination].metric:
+                print(f"[RoutingTable] Updating route to {destination} via {new_route.next_hop} with metric {new_route.metric} latency {latency_str} due to lower metric")
+                self._routes[destination] = new_route
+                self.add_kernel_route(
+                    destination=str(new_route.destination_network),
+                    gateway=str(new_route.next_hop)
+                )
+
+            elif new_route.latency_ms < self._routes[destination].latency_ms:
+                print(f"[RoutingTable] Updating route to {destination} via {new_route.next_hop} with metric {new_route.metric} latency {latency_str} due to lower latency")
                 self._routes[destination] = new_route
                 self.add_kernel_route(
                     destination=str(new_route.destination_network),
@@ -78,6 +115,7 @@ class RoutingTable:
 
             # Se a rota veio do mesmo vizinho, apenas renova o timestamp
             elif self._routes[destination].next_hop == new_route.next_hop:
+                print(f"[RoutingTable] Updating route timestamp to {destination} via {new_route.next_hop}")
                 self._routes[destination].timestamp = new_route.timestamp
 
     def get_route(self, destination: ipaddress.IPv4Network) -> Optional[RouteEntry]:
@@ -89,6 +127,11 @@ class RoutingTable:
         """Retorna uma cópia de todas as rotas ativas."""
         with self._lock:
             return list(self._routes.values())
+
+    def get_direct_neighbors(self) -> List[str]:
+        """Retorna uma lista de IPs de vizinhos diretamente conectados (métrica > 0)."""
+        with self._lock:
+            return list(str(route.next_hop) for route in self._routes.values() if route.metric > 0)
 
     def remove_expired_routes(self, timeout: int):
         """Varre a tabela e remove rotas que não são atualizadas há algum tempo."""
@@ -112,7 +155,7 @@ class RoutingTable:
             return
 
         print(f"[Kernel] Adding route {destination} via {gateway} to kernel routing table")
-        command = ["ip", "route", "add", destination, "via", gateway]
+        command = ["ip", "route", "add", destination, "via", gateway, "2>/dev/null"]
         print(f"[Kernel] { ' '.join(command) }")
 
         subprocess.run(command, check=False)
@@ -123,7 +166,7 @@ class RoutingTable:
             return
 
         print(f"[Kernel] Removing route {destination} via {gateway} from kernel routing table")
-        command = ["ip", "route", "del", destination, "via", gateway]
+        command = ["ip", "route", "del", destination, "via", gateway, "2>/dev/null"]
         print(f"[Kernel] { ' '.join(command) }")
 
         subprocess.run(command, check=False)
@@ -135,10 +178,10 @@ class RoutingTable:
 
             routes_copy = list(self._routes.values())
 
-        header = "Destination          | Next Hop        | Metric | Interface\n"
-        divider = "---------------------+-----------------+--------+----------\n"
+        header = "Destination          | Next Hop        | Metric | Latency (ms) | Interface\n"
+        divider = "---------------------+-----------------+--------+--------------+----------\n"
         rows = [
-            f"{str(route.destination_network):<20} | {str(route.next_hop):<15} | {route.metric:<6} | {route.outgoing_interface}\n"
+            f"{str(route.destination_network):<20} | {str(route.next_hop):<15} | {route.metric:<6} | {1000 * route.latency_ms:<12.2f} | {route.outgoing_interface}\n"
             for route in routes_copy
         ]
         return header + divider + "".join(rows)
@@ -150,48 +193,81 @@ class NetworkInterface:
     name: str
     ip_interface: ipaddress.IPv4Interface
     mac_address: str
-    state: str  # "UP" or "DOWN"
+    state: str  # "UP" ou "DOWN"
     # TODO: atualizar estado da interface com base no kernel
 
 
 class ProtocolHandler:
     """Responsável por toda a comunicação de rede do protocolo de roteamento."""
+    PROTOCOL_VERSION = 1
+    HEADER_SIZE = 2
+
+    # Tipos de Pacote
+    PACKET_TYPE_UPDATE = 1
+    PACKET_TYPE_METRIC_PROBE_REQUEST = 2
+    PACKET_TYPE_METRIC_PROBE_REPLY = 3
 
     def __init__(self, router_id: ipaddress.IPv4Address, routing_table: RoutingTable):
         self.router_id = router_id
         self.routing_table = routing_table
         self.protocol_port = 50000
+
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
         # O envio/recebimento via broadcast funcionou somente com o bind em todas as interfaces
         # ('', ou 0.0.0.0). Essa opção informa ao kernel que a porta pode ser utilizada por n
         # processos, quando esta no estádo de TIME_WAIT
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-
         # Pede ao kernel informações sobre a interface recebida. Usado para o split horizon
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_PKTINFO, 1)
-
         self.sock.bind(('', self.protocol_port))
 
-    def parse_incoming_packet(self, data: bytes, source_ip: str, incoming_interface_name: str):
-        """Interpreta um pacote recebido e atualiza a tabela de roteamento."""
+        self.neighbor_latency: Dict[str, float] = {}
+
+    def _create_header(self, packet_type: int) -> bytes:
+        """Cria o cabeçalho binário de 2 bytes para um pacote."""
+        return struct.pack('!BB', self.PROTOCOL_VERSION, packet_type)
+
+    def _handle_routing_update(self, data: bytes, source_ip: str, incoming_interface_name: str):
+        """Interpreta um pacote de atualização de tabelas."""
         payload = data.decode('utf-8')
         received_routes = payload.split(';')
 
+        latency_to_neighbor = self.neighbor_latency.get(source_ip, float('inf'))
+
         for route_str in received_routes:
             try:
-                dest_str, metric_str = route_str.split(',')
+                dest_str, metric_str, latency_str = route_str.split(',')
+                total_latency = latency_to_neighbor + float(latency_str)
+
                 print(f"[ProtocolHandler] {source_ip} send route {dest_str} with metric {metric_str}")
                 new_entry = RouteEntry(
                     destination_network=ipaddress.IPv4Network(dest_str),
                     next_hop=ipaddress.IPv4Address(source_ip),
                     metric=int(metric_str) + 1,
+                    latency_ms=total_latency,
                     outgoing_interface=incoming_interface_name
                 )
                 self.routing_table.add_or_update_route(new_entry)
             except (ValueError, IndexError):
                 print(f"[ProtocolHandler] Malformed route data received from {source_ip}: {route_str}")
+
+    def _handle_probe_request(self, data: bytes, source_ip: str, incoming_interface_name: str):
+        """Interpreta um pacote de requisição de probe."""
+        payload_str = str(time.time())
+        payload_bytes = payload_str.encode('utf-8')
+
+        header = self._create_header(self.PACKET_TYPE_METRIC_PROBE_REPLY)
+        full_packet = header + payload_bytes
+
+        print(f"[ProtocolHandler] Sending a probe reply to {source_ip}")
+        self.sock.sendto(full_packet, (source_ip, self.protocol_port))
+
+    def _handle_probe_reply(self, data: bytes, source_ip: str, incoming_interface_name: str):
+        """Interpreta um pacote de resposta ao probe."""
+        received_timestamp = float(data.decode('utf-8'))
+        rtt = time.time() - received_timestamp
+        self.neighbor_latency[source_ip] = rtt
 
     def gossip_table(self, interfaces: List[NetworkInterface]):
         """Envia a tabela de rotas para vizinhos."""
@@ -206,12 +282,31 @@ class ProtocolHandler:
                 if not routes_to_send:
                     continue
 
-                payload = ";".join([f"{r.destination_network},{r.metric}" for r in routes_to_send])
-                update_packet = payload.encode('utf-8')
+                # rede/máscara,metrica,latencia
+                payload_str = ";".join([f"{r.destination_network},{r.metric},{r.latency_ms}" for r in routes_to_send])
+                payload_bytes = payload_str.encode('utf-8')
+
+                header = self._create_header(self.PACKET_TYPE_UPDATE)
+                full_packet = header + payload_bytes
+
+                print(header.decode('utf-8'))
+                print(full_packet.decode('utf-8'))
 
                 broadcast_address = str(iface.ip_interface.network.broadcast_address)
                 print(f"[ProtocolHandler] Sending routing update via {iface.name} to {broadcast_address}")
-                self.sock.sendto(update_packet, (broadcast_address, self.protocol_port))
+                self.sock.sendto(full_packet, (broadcast_address, self.protocol_port))
+
+    def probe_request(self):
+        """Envia um pacote para as medições de latência."""
+        for neighbor in self.routing_table.get_direct_neighbors():
+            payload_str = str(time.time())
+            payload_bytes = payload_str.encode('utf-8')
+
+            header = self._create_header(self.PACKET_TYPE_METRIC_PROBE_REQUEST)
+            full_packet = header + payload_bytes
+
+            print(f"[ProtocolHandler] Sending a probe request to {neighbor}")
+            self.sock.sendto(full_packet, (neighbor, self.protocol_port))
 
     def listen_for_packets(self):
         """Loop principal para escutar pacotes de outros roteadores."""
@@ -233,8 +328,28 @@ class ProtocolHandler:
                         incoming_interface_name = if_map.get(if_index, "unknown")
                         break
 
-                print(f"[ProtocolHandler] Received packet from {source_ip} at {incoming_interface_name} interface")
-                self.parse_incoming_packet(data, source_ip, incoming_interface_name)
+                version, packet_type = struct.unpack_from('!BB', data)
+                payload_bytes = data[self.HEADER_SIZE:]
+
+                if version != self.PROTOCOL_VERSION:
+                    print("[ProtocolHandler] Message discarted, unknown version")
+                    continue
+
+                if packet_type == self.PACKET_TYPE_UPDATE:
+                    print(f"[ProtocolHandler] Received update from {source_ip} via {incoming_interface_name} interface")
+                    self._handle_routing_update(payload_bytes, source_ip, incoming_interface_name)
+
+                elif packet_type == self.PACKET_TYPE_METRIC_PROBE_REQUEST:
+                    print(f"[ProtocolHandler] Received probe request from {source_ip} via {incoming_interface_name} interface")
+                    self._handle_probe_request(payload_bytes, source_ip, incoming_interface_name)
+
+                elif packet_type == self.PACKET_TYPE_METRIC_PROBE_REPLY:
+                    print(f"[ProtocolHandler] Received probe reply from {source_ip} via {incoming_interface_name} interface")
+                    self._handle_probe_reply(payload_bytes, source_ip, incoming_interface_name)
+
+                else:
+                    print(f"[ProtocolHandler] Received unknown packet {packet_type} from {source_ip} via {incoming_interface_name}")
+
             except OSError as e:
                 print(f"[ProtocolHandler] Socket error: {e}")
                 break
@@ -281,6 +396,7 @@ class Router:
                     destination_network=iface.ip_interface.network,
                     next_hop=ipaddress.IPv4Address("0.0.0.0"),
                     metric=0,
+                    latency_ms=0.0,
                     outgoing_interface=iface.name
                 )
                 self.routing_table.add_or_update_route(connected_route)
@@ -301,6 +417,7 @@ class Router:
             try:
                 self.routing_table.remove_expired_routes(self.route_timeout)
                 self.protocol_handler.gossip_table(self.interfaces)
+                self.protocol_handler.probe_request()
 
                 print("\n--- Current Routing Table ---")
                 print(self.routing_table.get_printable_string())
