@@ -7,26 +7,56 @@ from typing import List, Dict, Optional
 import argparse
 import ipaddress
 import subprocess
+import random
 
 # Protocolo:
 # +-------------+-----------+-------+
 # | Versão (1B) | Tipo (1B) | Dados |
 # +-------------+-----------+-------+
 #
-# Os bytes de dados sempre trafegam convertidos com utf-8.
-#
 # Tipos:
 # PACKET_TYPE_UPDATE
 #   Pacote com os dados das rotas que não foram recebidas por essa interface. Dados são
-#   ip,custo,latência separados por ;. Exemplo 192.168.1.0,2,15;10.10.1.0,3,12. Esse pacote instrui
-#   o roteador a atualizar sua tabela de roteamento, se necessário. Não espera nenhuma resposta.
+#   ip,custo,latência,perda separados por ;. Exemplo 192.168.1.0,2,15,2;10.10.1.0,3,12,3. Os bytes
+#   de dados trafegam convertidos com utf-8.
+#   Esse pacote instrui o roteador a atualizar sua tabela de roteamento, se necessário.
+#   Caso a rota recebida não exista na tabela, ela é adicionada na tabela interna e na tabela do OS.
+#   Caso a rota foi recebida pelo mesmo vizinho, atualiza a tabela interna independente das
+#   métricas. Nesse caso não é preciso atualizar a tabela do OS.
+#   Caso a rota recebida não veio pelo mesmo vizinho, a rota atualiza se, seguindo a ordem:
+#       1. O número de saltos seja menor
+#       2. A perda de pacotes seja menor
+#       3. A latência seja menor
+#   Se alguma dessas condições for atendida, respeitando essa ordem, a tabela interna é atualizada,
+#   a rota antiga é removida da tabela do OS e a nova rota é adicionada.
+#   Não espera nenhuma resposta.
 #
-# PACKET_TYPE_METRIC_PROBE_REQUEST
-#   Pacotes para medição das métricas. Dados são o timestamp. Espera uma resposta
-#   PACKET_TYPE_METRIC_PROBE_REPLY.
+# PACKET_TYPE_LATENCY_REQUEST
+#   Pacotes para medição das métricas. Dados são um número de sequência. A medição de latência é
+#   feita enviando para todos os vizinhos diretamente conectados um pacote com um número de
+#   sequência. Esse número é armazena em um mapa esse número com o momento em que foi enviado.
+#   Espera uma resposta PACKET_TYPE_LATENCY_REPLY.
 #
-# PACKET_TYPE_METRIC_PROBE_REPLY
-#   Resposta ao pacote de PACKET_TYPE_METRIC_PROBE_REQUEST. Dados são o timestamp atual.
+# PACKET_TYPE_LATENCY_REPLY
+#   Resposta ao pacote de PACKET_TYPE_LATENCY_REQUEST. Dados são o número de sequência recebido na
+#   requisição. Ao receber esse pacote, o roteador usa o tempo que a requisição foi enviada
+#   (presente no mapa) e o tempo atual para calcular o RTT (Round Trip Time). Tendo o RTT, o valor
+#   é armazenado/atualizado no mapa de latência para os vizinhos.
+#
+# PACKET_TYPE_LOSS_REQUEST
+#   Pacotes para medição da perda. A medição de perda é feita enviando para todos os vizinhos
+#   diretamente conectados múltiplos pacotes desse tipo e contando quantos foram recebidos. Os
+#   dados incluem um número de sessão do teste, usado para controlar de qual teste a resposta se
+#   refere, e um número de sequência, usado para controlar quantos pacotes foram perdidos. Espera
+#   uma resposta PACKET_TYPE_LOSS_REPLY para cada pacote enviado.
+#   O roteador que iniciou o teste mantém um mapa do número de sessão para um objeto de controle
+#   do teste, contendo por exemplo, o número de pacotes enviados e recebidos. Esse objeto de
+#   controle é usado para calcular a perda para o vizinho.
+#
+# PACKET_TYPE_LOSS_REPLY
+#   Resposta ao pacote de PACKET_TYPE_LOSS_REQUEST. Os dados são um eco do que foi recebido na
+#   requisição: o número da sessão e o número de sequência.
+#   Ao receber esse pacote, o número de pacotes recebidos para a sessão é incrementado.
 
 # TODO:
 # Protocolo
@@ -37,15 +67,18 @@ import subprocess
 # - [x] Expirar rota após TTL
 # - [x] Split horizon
 # Encaminhamento
-# - [ ] Encaminhar um pacote de dado com base na métrica
+# - [x] Encaminhar um pacote de dado com base na métrica
 # Kernel
 # - [x] Inserir rota na tabela do kernel
 # - [x] Remover rota da tabela do kernel
 # Probes para latência e perda de pacote
-# - [ ] Enviar probe para latência
-# - [ ] Enviar probes para perda de pacote
-# - [ ] Responder probes
-# - [ ] Recalcular métrica da rota
+# - [x] Enviar probe para latência
+# - [x] Enviar probes para perda de pacote
+# - [x] Responder probes
+# - [x] Recalcular métrica da rota
+
+# Introduz uma probabilidade de não responder o pacote de medição de perda para fins didáticos
+PACKET_LOSS_PROBABILITY = 0.5
 
 try:
     # Tenta acessar o atributo para ver se ele existe. Atributo só foi adicionado na versão 3.12,
@@ -66,10 +99,11 @@ class RouteEntry:
     metric: int
     outgoing_interface: str
     latency_ms: float = 0.0
+    loss_percent: float = 0.0
     timestamp: float = field(default_factory=time.time)
 
     def __str__(self):
-        return f"Dest: {self.destination_network}, NextHop: {self.next_hop}, Metric: {self.metric}, Iface: {self.outgoing_interface}"
+        return f"Dest: {self.destination_network}, NextHop: {self.next_hop}, Iface: {self.outgoing_interface}, Metric: {self.metric}, Latency: {self.latency_ms}, Loss: {self.loss_percent}"
 
     def is_expired(self, timeout_seconds: int) -> bool:
         """Verifica se a rota expirou com base no seu timestamp."""
@@ -83,40 +117,54 @@ class RoutingTable:
         self._routes: Dict[ipaddress.IPv4Network, RouteEntry] = {}
         self._lock = threading.Lock()
 
+    def _is_new_route_better(self, existing_route: RouteEntry, new_route: RouteEntry) -> bool:
+        """Define a função de custo para determinar a melhor rota."""
+        # Métrica (contagem de saltos) é o mais importante
+        if new_route.metric < existing_route.metric:
+            return True
+        if new_route.metric > existing_route.metric:
+            return False
+
+        # Se a métrica for igual, a perda de pacotes é o desempate
+        if new_route.packet_loss < existing_route.packet_loss:
+            return True
+        if new_route.packet_loss > existing_route.packet_loss:
+            return False
+
+        # Se a perda também for igual, a latência é o desempate
+        if new_route.latency_ms < existing_route.latency_ms:
+            return True
+
+        return False
+
     def add_or_update_route(self, new_route: RouteEntry):
         """Adiciona uma nova rota ou atualiza uma existente se a nova for melhor (métrica menor)."""
         with self._lock:
             destination = new_route.destination_network
-            latency_str = "inf" if new_route.latency_ms == float('inf') else f"{1000 * new_route.latency_ms:.2f}ms"
 
+            # A rota para este destino ainda não existe. Simplesmente adiciona.
             if destination not in self._routes:
-                print(f"[RoutingTable] Adding route to {destination} via {new_route.next_hop} with metric {new_route.metric} latency {latency_str}")
+                print(f"[RoutingTable] New route to {destination} via {new_route.next_hop}")
                 self._routes[destination] = new_route
-                self.add_kernel_route(
-                    destination=str(new_route.destination_network),
-                    gateway=str(new_route.next_hop)
-                )
+                self.add_kernel_route(str(destination), str(new_route.next_hop))
+                return
 
-            elif new_route.metric < self._routes[destination].metric:
-                print(f"[RoutingTable] Updating route to {destination} via {new_route.next_hop} with metric {new_route.metric} latency {latency_str} due to lower metric")
+            existing_route = self._routes[destination]
+
+            # A atualização vem do mesmo vizinho que a rota atual.
+            # Aceitar sempre a atualização, seja ela melhor ou pior.
+            if existing_route.next_hop == new_route.next_hop:
+                print(f"[RoutingTable] Updating metrics to {destination} via {new_route.next_hop}")
                 self._routes[destination] = new_route
-                self.add_kernel_route(
-                    destination=str(new_route.destination_network),
-                    gateway=str(new_route.next_hop)
-                )
+                return
 
-            elif new_route.latency_ms < self._routes[destination].latency_ms:
-                print(f"[RoutingTable] Updating route to {destination} via {new_route.next_hop} with metric {new_route.metric} latency {latency_str} due to lower latency")
+            # A atualização vem de um vizinho diferente.
+            # Comparar para ver se o novo caminho é melhor.
+            if self._is_new_route_better(existing_route, new_route):
+                print(f"[RoutingTable] New best path to {destination} via {new_route.next_hop}")
+                self.del_kernel_route(str(destination), str(existing_route.next_hop))
+                self.add_kernel_route(str(destination), str(new_route.next_hop))
                 self._routes[destination] = new_route
-                self.add_kernel_route(
-                    destination=str(new_route.destination_network),
-                    gateway=str(new_route.next_hop)
-                )
-
-            # Se a rota veio do mesmo vizinho, apenas renova o timestamp
-            elif self._routes[destination].next_hop == new_route.next_hop:
-                print(f"[RoutingTable] Updating route timestamp to {destination} via {new_route.next_hop}")
-                self._routes[destination].timestamp = new_route.timestamp
 
     def get_route(self, destination: ipaddress.IPv4Network) -> Optional[RouteEntry]:
         """Retorna a rota para uma rede específica."""
@@ -131,7 +179,8 @@ class RoutingTable:
     def get_direct_neighbors(self) -> List[str]:
         """Retorna uma lista de IPs de vizinhos diretamente conectados (métrica > 0)."""
         with self._lock:
-            return list(str(route.next_hop) for route in self._routes.values() if route.metric > 0)
+            distinct_neighbors = {str(route.next_hop) for route in self._routes.values() if route.metric > 0}
+            return list(distinct_neighbors)
 
     def remove_expired_routes(self, timeout: int):
         """Varre a tabela e remove rotas que não são atualizadas há algum tempo."""
@@ -155,7 +204,7 @@ class RoutingTable:
             return
 
         print(f"[Kernel] Adding route {destination} via {gateway} to kernel routing table")
-        command = ["ip", "route", "add", destination, "via", gateway, "2>/dev/null"]
+        command = ["ip", "route", "add", destination, "via", gateway]
         print(f"[Kernel] { ' '.join(command) }")
 
         subprocess.run(command, check=False)
@@ -166,7 +215,7 @@ class RoutingTable:
             return
 
         print(f"[Kernel] Removing route {destination} via {gateway} from kernel routing table")
-        command = ["ip", "route", "del", destination, "via", gateway, "2>/dev/null"]
+        command = ["ip", "route", "del", destination, "via", gateway]
         print(f"[Kernel] { ' '.join(command) }")
 
         subprocess.run(command, check=False)
@@ -178,10 +227,10 @@ class RoutingTable:
 
             routes_copy = list(self._routes.values())
 
-        header = "Destination          | Next Hop        | Metric | Latency (ms) | Interface\n"
-        divider = "---------------------+-----------------+--------+--------------+----------\n"
+        header = "Destination          | Next Hop        | Metric | Latency (ms) | Loss (%) | Interface\n"
+        divider = "---------------------+-----------------+--------+--------------+----------+----------\n"
         rows = [
-            f"{str(route.destination_network):<20} | {str(route.next_hop):<15} | {route.metric:<6} | {1000 * route.latency_ms:<12.2f} | {route.outgoing_interface}\n"
+            f"{str(route.destination_network):<20} | {str(route.next_hop):<15} | {route.metric:<6} | {1000 * route.latency_ms:<12.2f} | {route.loss_percent:<8} | {route.outgoing_interface}\n"
             for route in routes_copy
         ]
         return header + divider + "".join(rows)
@@ -204,8 +253,10 @@ class ProtocolHandler:
 
     # Tipos de Pacote
     PACKET_TYPE_UPDATE = 1
-    PACKET_TYPE_METRIC_PROBE_REQUEST = 2
-    PACKET_TYPE_METRIC_PROBE_REPLY = 3
+    PACKET_TYPE_LATENCY_REQUEST = 2
+    PACKET_TYPE_LATENCY_REPLY = 3
+    PACKET_TYPE_LOSS_REQUEST = 4
+    PACKET_TYPE_LOSS_REPLY = 5
 
     def __init__(self, router_id: ipaddress.IPv4Address, routing_table: RoutingTable):
         self.router_id = router_id
@@ -222,7 +273,15 @@ class ProtocolHandler:
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_PKTINFO, 1)
         self.sock.bind(('', self.protocol_port))
 
+        # {ip_vizinho: latencia_em_ms}
         self.neighbor_latency: Dict[str, float] = {}
+        self.neighbor_loss: Dict[str, float] = {}
+
+        self._probe_seq_num = 0
+        self._pending_probes: Dict[int, float] = {}  # {seq_num: send_timestamp}
+        self._loss_session_id = 0
+        self._pending_loss_tests: Dict[int, Dict] = {}  # {session_id: {sent_time, count, received: set, dest}}
+        self._probes_lock = threading.Lock()
 
     def _create_header(self, packet_type: int) -> bytes:
         """Cria o cabeçalho binário de 2 bytes para um pacote."""
@@ -230,44 +289,87 @@ class ProtocolHandler:
 
     def _handle_routing_update(self, data: bytes, source_ip: str, incoming_interface_name: str):
         """Interpreta um pacote de atualização de tabelas."""
+        print(f"[ProtocolHandler] Received update from {source_ip} via {incoming_interface_name} interface")
+
         payload = data.decode('utf-8')
         received_routes = payload.split(';')
 
         latency_to_neighbor = self.neighbor_latency.get(source_ip, float('inf'))
+        loss_to_neighbor = self.neighbor_loss.get(source_ip, 100.0)
 
         for route_str in received_routes:
             try:
-                dest_str, metric_str, latency_str = route_str.split(',')
-                total_latency = latency_to_neighbor + float(latency_str)
+                print(f"[ProtocolHandler] {source_ip} send {route_str}")
+                dest_str, metric_str, latency_str, loss_str = route_str.split(',')
 
-                print(f"[ProtocolHandler] {source_ip} send route {dest_str} with metric {metric_str}")
+                total_latency = latency_to_neighbor + float(latency_str)
+                path_loss = max(loss_to_neighbor, float(loss_str))
+
+                print(f"[ProtocolHandler] {source_ip} send route {dest_str} with metric {metric_str} latency {total_latency} loss {path_loss}")
                 new_entry = RouteEntry(
                     destination_network=ipaddress.IPv4Network(dest_str),
                     next_hop=ipaddress.IPv4Address(source_ip),
                     metric=int(metric_str) + 1,
                     latency_ms=total_latency,
+                    loss_percent=path_loss,
                     outgoing_interface=incoming_interface_name
                 )
                 self.routing_table.add_or_update_route(new_entry)
             except (ValueError, IndexError):
                 print(f"[ProtocolHandler] Malformed route data received from {source_ip}: {route_str}")
 
-    def _handle_probe_request(self, data: bytes, source_ip: str, incoming_interface_name: str):
+    def _handle_probe_request(self, data: bytes, source_ip: str):
         """Interpreta um pacote de requisição de probe."""
-        payload_str = str(time.time())
-        payload_bytes = payload_str.encode('utf-8')
+        print(f"[ProtocolHandler] Received probe request from {source_ip}")
 
-        header = self._create_header(self.PACKET_TYPE_METRIC_PROBE_REPLY)
+        seq_num = struct.unpack_from('!I', data)[0]
+        payload_bytes = struct.pack('!I', seq_num)
+        header = self._create_header(self.PACKET_TYPE_LATENCY_REPLY)
         full_packet = header + payload_bytes
 
-        print(f"[ProtocolHandler] Sending a probe reply to {source_ip}")
+        print(f"[ProtocolHandler] Sending a probe reply #{seq_num} to {source_ip}")
         self.sock.sendto(full_packet, (source_ip, self.protocol_port))
 
-    def _handle_probe_reply(self, data: bytes, source_ip: str, incoming_interface_name: str):
+    def _handle_probe_reply(self, data: bytes, source_ip: str):
         """Interpreta um pacote de resposta ao probe."""
-        received_timestamp = float(data.decode('utf-8'))
-        rtt = time.time() - received_timestamp
-        self.neighbor_latency[source_ip] = rtt
+        print(f"[ProtocolHandler] Received probe reply from {source_ip}")
+
+        seq_num = struct.unpack_from('!I', data)[0]
+        with self._probes_lock:
+            if seq_num in self._pending_probes:
+                start_time = self._pending_probes.pop(seq_num)
+                rtt = time.time() - start_time
+                self.neighbor_latency[source_ip] = rtt
+                print(f"[ProtocolHandler] Received probe reply #{seq_num} from {source_ip}. RTT: {rtt*1000:.2f} ms")
+            else:
+                print(f"[ProtocolHandler] Received unexpected probe reply #{seq_num} from {source_ip}")
+
+    def _handle_loss_request(self, data: bytes, source_ip: str):
+        """Interpreta um pacote de requisição ao probe de perda de pacote."""
+        print(f"[ProtocolHandler] Received packet loss probe request from {source_ip}")
+
+        # Intruduzir uma probabilidade de falha para simular perda de pacotes
+        if random.random() < PACKET_LOSS_PROBABILITY:
+            print("[ProtocolHandler] Simulatin packet loss")
+            return
+
+        session_id, seq_num = struct.unpack_from('!II', data)
+        reply_payload = struct.pack('!II', session_id, seq_num)
+
+        header = self._create_header(self.PACKET_TYPE_LOSS_REPLY)
+        full_packet = header + reply_payload
+
+        print(f"[ProtocolHandler] Sending a packet loss probe reply #{seq_num} to {source_ip} (session {session_id})")
+        self.sock.sendto(full_packet, (source_ip, self.protocol_port))
+
+    def _handle_loss_reply(self, data: bytes, source_ip: str):
+        """Interpreta um pacote de resposta ao probe de perda de pacote."""
+        session_id, seq_num = struct.unpack_from('!II', data)
+        print(f"[ProtocolHandler] Received packet loss probe reply #{seq_num} from {source_ip} (session {session_id})")
+
+        with self._probes_lock:
+            if session_id in self._pending_loss_tests:
+                self._pending_loss_tests[session_id]["received"].add(seq_num)
 
     def gossip_table(self, interfaces: List[NetworkInterface]):
         """Envia a tabela de rotas para vizinhos."""
@@ -282,8 +384,8 @@ class ProtocolHandler:
                 if not routes_to_send:
                     continue
 
-                # rede/máscara,metrica,latencia
-                payload_str = ";".join([f"{r.destination_network},{r.metric},{r.latency_ms}" for r in routes_to_send])
+                # rede/máscara,metrica,latencia,perda
+                payload_str = ";".join([f"{r.destination_network},{r.metric},{r.latency_ms},{r.loss_percent}" for r in routes_to_send])
                 payload_bytes = payload_str.encode('utf-8')
 
                 header = self._create_header(self.PACKET_TYPE_UPDATE)
@@ -298,15 +400,63 @@ class ProtocolHandler:
 
     def probe_request(self):
         """Envia um pacote para as medições de latência."""
-        for neighbor in self.routing_table.get_direct_neighbors():
-            payload_str = str(time.time())
-            payload_bytes = payload_str.encode('utf-8')
+        with self._probes_lock:
+            self._probe_seq_num += 1
+            seq_num = self._probe_seq_num
+            # Armazena o momento do envio para calcular o RTT depois
+            self._pending_probes[seq_num] = time.time()
 
-            header = self._create_header(self.PACKET_TYPE_METRIC_PROBE_REQUEST)
+        for neighbor in self.routing_table.get_direct_neighbors():
+            payload_bytes = struct.pack('!I', seq_num)  # 'I' = Unsigned Int de 4 bytes
+            header = self._create_header(self.PACKET_TYPE_LATENCY_REQUEST)
             full_packet = header + payload_bytes
 
-            print(f"[ProtocolHandler] Sending a probe request to {neighbor}")
+            print(f"[ProtocolHandler] Sending a probe request #{seq_num} to {neighbor}")
             self.sock.sendto(full_packet, (neighbor, self.protocol_port))
+
+    def start_packet_loss_test(self, count: int = 10):
+        """Inicia uma sessão de teste de perda de pacotes enviando vários probes."""
+        for neighbor in self.routing_table.get_direct_neighbors():
+            with self._probes_lock:
+                self._loss_session_id += 1
+                session_id = self._loss_session_id
+                self._pending_loss_tests[session_id] = {
+                    "sent_time": time.time(),
+                    "count": count,
+                    "received": set(),
+                    "destination": neighbor
+                }
+
+            print(f"[ProtocolHandler] Starting packet loss test to {neighbor} (session #{session_id}, {count} packets)")
+            # O payload do pacote de perda conterá o ID da sessão e o número do pacote na rajada
+            for i in range(count):
+                seq_num_in_session = i + 1
+                payload_bytes = struct.pack('!II', session_id, seq_num_in_session)
+                header = self._create_header(self.PACKET_TYPE_LOSS_REQUEST)
+                full_packet = header + payload_bytes
+                self.sock.sendto(full_packet, (neighbor, self.protocol_port))
+
+    def check_and_report_loss_tests(self, timeout: float = 2.0):
+        """Verifica se algum teste de perda de pacotes expirou e reporta o resultado."""
+        with self._probes_lock:
+            for session_id in list(self._pending_loss_tests.keys()):
+                session = self._pending_loss_tests[session_id]
+                if time.time() - session["sent_time"] > timeout:
+                    sent_count = session["count"]
+                    received_count = len(session["received"])
+                    loss_count = sent_count - received_count
+                    loss_percent = (loss_count / sent_count) * 100 if sent_count > 0 else 0
+                    destination = session['destination']
+
+                    print(f"\n--- Packet loss test result ---\n"
+                          f"Destination: {destination} (session #{session_id})\n"
+                          f"  - Sent:   {sent_count}\n"
+                          f"  - Received:  {received_count}\n"
+                          f"  - Lost:   {loss_count} ({loss_percent:.1f}%)\n"
+                          f"--------------------------------------------")
+
+                    self.neighbor_loss[destination] = loss_percent
+                    del self._pending_loss_tests[session_id]
 
     def listen_for_packets(self):
         """Loop principal para escutar pacotes de outros roteadores."""
@@ -336,16 +486,19 @@ class ProtocolHandler:
                     continue
 
                 if packet_type == self.PACKET_TYPE_UPDATE:
-                    print(f"[ProtocolHandler] Received update from {source_ip} via {incoming_interface_name} interface")
                     self._handle_routing_update(payload_bytes, source_ip, incoming_interface_name)
 
-                elif packet_type == self.PACKET_TYPE_METRIC_PROBE_REQUEST:
-                    print(f"[ProtocolHandler] Received probe request from {source_ip} via {incoming_interface_name} interface")
-                    self._handle_probe_request(payload_bytes, source_ip, incoming_interface_name)
+                elif packet_type == self.PACKET_TYPE_LATENCY_REQUEST:
+                    self._handle_probe_request(payload_bytes, source_ip)
 
-                elif packet_type == self.PACKET_TYPE_METRIC_PROBE_REPLY:
-                    print(f"[ProtocolHandler] Received probe reply from {source_ip} via {incoming_interface_name} interface")
-                    self._handle_probe_reply(payload_bytes, source_ip, incoming_interface_name)
+                elif packet_type == self.PACKET_TYPE_LATENCY_REPLY:
+                    self._handle_probe_reply(payload_bytes, source_ip)
+
+                elif packet_type == self.PACKET_TYPE_LOSS_REQUEST:
+                    self._handle_loss_request(payload_bytes, source_ip)
+
+                elif packet_type == self.PACKET_TYPE_LOSS_REPLY:
+                    self._handle_loss_reply(payload_bytes, source_ip)
 
                 else:
                     print(f"[ProtocolHandler] Received unknown packet {packet_type} from {source_ip} via {incoming_interface_name}")
@@ -408,7 +561,6 @@ class Router:
 
     def start(self):
         """Inicia todas as operações do roteador."""
-        # Iniciar o listener de pacotes em uma thread separada para não bloquear o resto
         listener_thread = threading.Thread(target=self.protocol_handler.listen_for_packets, daemon=True)
         listener_thread.start()
 
@@ -418,6 +570,8 @@ class Router:
                 self.routing_table.remove_expired_routes(self.route_timeout)
                 self.protocol_handler.gossip_table(self.interfaces)
                 self.protocol_handler.probe_request()
+                self.protocol_handler.start_packet_loss_test()
+                self.protocol_handler.check_and_report_loss_tests()
 
                 print("\n--- Current Routing Table ---")
                 print(self.routing_table.get_printable_string())
