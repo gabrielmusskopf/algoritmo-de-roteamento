@@ -78,7 +78,49 @@ import random
 # - [x] Recalcular métrica da rota
 
 # Introduz uma probabilidade de não responder o pacote de medição de perda para fins didáticos
-PACKET_LOSS_PROBABILITY = 0.5
+PACKET_LOSS_PROBABILITY = 0.0
+
+LOG_LEVELS = {"error": 1, "warn": 2, "info": 3, "debug": 4, "trace": 5}
+LOG_LEVEL = LOG_LEVELS.get("debug")
+
+
+def is_level_enabled(level: int) -> bool:
+    global LOG_LEVEL
+    return level <= LOG_LEVEL
+
+
+def is_info_enabled() -> bool:
+    value = LOG_LEVELS.get("info")
+    return is_level_enabled(value)
+
+
+def log(level: str, message: str, tag: str = None) -> None:
+    value = LOG_LEVELS.get(level, 4)
+    level = f"{level}:"
+    tag = f"[{tag}] " if tag else ""
+    if is_level_enabled(value):
+        print(f"{level:<6} {tag}{message}")
+
+
+def trace(message: str, tag: str = None) -> None:
+    log("trace", message, tag)
+
+
+def debug(message: str, tag: str = None) -> None:
+    log("debug", message, tag)
+
+
+def info(message: str, tag: str = None) -> None:
+    log("info", message, tag)
+
+
+def warn(message: str, tag: str = None) -> None:
+    log("warn", message, tag)
+
+
+def error(message: str, tag: str = None) -> None:
+    log("error", message, tag)
+
 
 try:
     # Tenta acessar o atributo para ver se ele existe. Atributo só foi adicionado na versão 3.12,
@@ -144,7 +186,7 @@ class RoutingTable:
 
             # A rota para este destino ainda não existe. Simplesmente adiciona.
             if destination not in self._routes:
-                print(f"[RoutingTable] New route to {destination} via {new_route.next_hop}")
+                info(f"New route to {destination} via {new_route.next_hop}", tag="RoutingTable")
                 self._routes[destination] = new_route
                 self.add_kernel_route(str(destination), str(new_route.next_hop))
                 return
@@ -154,14 +196,14 @@ class RoutingTable:
             # A atualização vem do mesmo vizinho que a rota atual.
             # Aceitar sempre a atualização, seja ela melhor ou pior.
             if existing_route.next_hop == new_route.next_hop:
-                print(f"[RoutingTable] Updating metrics to {destination} via {new_route.next_hop}")
+                info(f"Updating metrics to {destination} via {new_route.next_hop}", tag="RoutingTable")
                 self._routes[destination] = new_route
                 return
 
             # A atualização vem de um vizinho diferente.
             # Comparar para ver se o novo caminho é melhor.
             if self._is_new_route_better(existing_route, new_route):
-                print(f"[RoutingTable] New best path to {destination} via {new_route.next_hop}")
+                info(f"New best path to {destination} via {new_route.next_hop}", tag="RoutingTable")
                 self.del_kernel_route(str(destination), str(existing_route.next_hop))
                 self.add_kernel_route(str(destination), str(new_route.next_hop))
                 self._routes[destination] = new_route
@@ -190,7 +232,7 @@ class RoutingTable:
             ]
             for expired_route in expired_routes:
                 dest = expired_route.destination_network
-                print(f"[RoutingTable] Route to {dest} expired. Removing.")
+                info(f"Route to {dest} expired. Removing.", tag="RoutingTable")
                 del self._routes[dest]
 
                 self.del_kernel_route(
@@ -203,22 +245,22 @@ class RoutingTable:
         if gateway == "0.0.0.0":
             return
 
-        print(f"[Kernel] Adding route {destination} via {gateway} to kernel routing table")
+        info(f"Adding route {destination} via {gateway} to kernel routing table", tag="Kernel")
         command = ["ip", "route", "add", destination, "via", gateway]
-        print(f"[Kernel] { ' '.join(command) }")
+        debug(f"{ ' '.join(command) }", tag="Kernel")
 
-        subprocess.run(command, check=False)
+        subprocess.run(command, check=False, stderr=subprocess.DEVNULL)
 
     def del_kernel_route(self, destination: str, gateway: str):
         """Remove uma rota da tabela do kernel usando o comando 'ip'."""
         if gateway == "0.0.0.0":
             return
 
-        print(f"[Kernel] Removing route {destination} via {gateway} from kernel routing table")
+        info(f"Removing route {destination} via {gateway} from kernel routing table", tag="Kernel")
         command = ["ip", "route", "del", destination, "via", gateway]
-        print(f"[Kernel] { ' '.join(command) }")
+        debug(f"{ ' '.join(command) }", tag="Kernel")
 
-        subprocess.run(command, check=False)
+        subprocess.run(command, check=False, stderr=subprocess.DEVNULL)
 
     def get_printable_string(self) -> str:
         with self._lock:
@@ -289,7 +331,7 @@ class ProtocolHandler:
 
     def _handle_routing_update(self, data: bytes, source_ip: str, incoming_interface_name: str):
         """Interpreta um pacote de atualização de tabelas."""
-        print(f"[ProtocolHandler] Received update from {source_ip} via {incoming_interface_name} interface")
+        info(f"Received update from {source_ip} via {incoming_interface_name} interface", tag="ProtocolHandler")
 
         payload = data.decode('utf-8')
         received_routes = payload.split(';')
@@ -299,13 +341,13 @@ class ProtocolHandler:
 
         for route_str in received_routes:
             try:
-                print(f"[ProtocolHandler] {source_ip} send {route_str}")
+                info(f"{source_ip} send {route_str}", tag="ProtocolHandler")
                 dest_str, metric_str, latency_str, loss_str = route_str.split(',')
 
                 total_latency = latency_to_neighbor + float(latency_str)
                 path_loss = max(loss_to_neighbor, float(loss_str))
 
-                print(f"[ProtocolHandler] {source_ip} send route {dest_str} with metric {metric_str} latency {total_latency} loss {path_loss}")
+                info(f"{source_ip} send route {dest_str} with metric {metric_str} latency {total_latency} loss {path_loss}", tag="ProtocolHandler")
                 new_entry = RouteEntry(
                     destination_network=ipaddress.IPv4Network(dest_str),
                     next_hop=ipaddress.IPv4Address(source_ip),
@@ -316,23 +358,22 @@ class ProtocolHandler:
                 )
                 self.routing_table.add_or_update_route(new_entry)
             except (ValueError, IndexError):
-                print(f"[ProtocolHandler] Malformed route data received from {source_ip}: {route_str}")
+                warn(f"Malformed route data received from {source_ip}: {route_str}", tag="ProtocolHandler")
 
-    def _handle_probe_request(self, data: bytes, source_ip: str):
+    def _handle_latency_request(self, data: bytes, source_ip: str):
         """Interpreta um pacote de requisição de probe."""
-        print(f"[ProtocolHandler] Received probe request from {source_ip}")
+        trace(f"Received latency probe request from {source_ip}", tag="ProtocolHandler")
 
         seq_num = struct.unpack_from('!I', data)[0]
         payload_bytes = struct.pack('!I', seq_num)
         header = self._create_header(self.PACKET_TYPE_LATENCY_REPLY)
         full_packet = header + payload_bytes
 
-        print(f"[ProtocolHandler] Sending a probe reply #{seq_num} to {source_ip}")
+        trace(f"Sending a latency probe reply #{seq_num} to {source_ip}", tag="ProtocolHandler")
         self.sock.sendto(full_packet, (source_ip, self.protocol_port))
 
-    def _handle_probe_reply(self, data: bytes, source_ip: str):
+    def _handle_latency_reply(self, data: bytes, source_ip: str):
         """Interpreta um pacote de resposta ao probe."""
-        print(f"[ProtocolHandler] Received probe reply from {source_ip}")
 
         seq_num = struct.unpack_from('!I', data)[0]
         with self._probes_lock:
@@ -340,17 +381,17 @@ class ProtocolHandler:
                 start_time = self._pending_probes.pop(seq_num)
                 rtt = time.time() - start_time
                 self.neighbor_latency[source_ip] = rtt
-                print(f"[ProtocolHandler] Received probe reply #{seq_num} from {source_ip}. RTT: {rtt*1000:.2f} ms")
+                trace(f"Received latency probe reply #{seq_num} from {source_ip}. RTT: {rtt*1000:.2f} ms", tag="ProtocolHandler")
             else:
-                print(f"[ProtocolHandler] Received unexpected probe reply #{seq_num} from {source_ip}")
+                warn(f"Received unexpected latency probe reply #{seq_num} from {source_ip}", tag="ProtocolHandler")
 
     def _handle_loss_request(self, data: bytes, source_ip: str):
         """Interpreta um pacote de requisição ao probe de perda de pacote."""
-        print(f"[ProtocolHandler] Received packet loss probe request from {source_ip}")
+        trace(f"Received packet loss probe request from {source_ip}", tag="ProtocolHandler")
 
         # Intruduzir uma probabilidade de falha para simular perda de pacotes
         if random.random() < PACKET_LOSS_PROBABILITY:
-            print("[ProtocolHandler] Simulatin packet loss")
+            debug("Simulatin packet loss", tag="ProtocolHandler")
             return
 
         session_id, seq_num = struct.unpack_from('!II', data)
@@ -359,13 +400,13 @@ class ProtocolHandler:
         header = self._create_header(self.PACKET_TYPE_LOSS_REPLY)
         full_packet = header + reply_payload
 
-        print(f"[ProtocolHandler] Sending a packet loss probe reply #{seq_num} to {source_ip} (session {session_id})")
+        trace(f"Sending a packet loss probe reply #{seq_num} to {source_ip} (session {session_id})", tag="ProtocolHandler")
         self.sock.sendto(full_packet, (source_ip, self.protocol_port))
 
     def _handle_loss_reply(self, data: bytes, source_ip: str):
         """Interpreta um pacote de resposta ao probe de perda de pacote."""
         session_id, seq_num = struct.unpack_from('!II', data)
-        print(f"[ProtocolHandler] Received packet loss probe reply #{seq_num} from {source_ip} (session {session_id})")
+        trace(f"Received packet loss probe reply #{seq_num} from {source_ip} (session {session_id})", tag="ProtocolHandler")
 
         with self._probes_lock:
             if session_id in self._pending_loss_tests:
@@ -391,11 +432,8 @@ class ProtocolHandler:
                 header = self._create_header(self.PACKET_TYPE_UPDATE)
                 full_packet = header + payload_bytes
 
-                print(header.decode('utf-8'))
-                print(full_packet.decode('utf-8'))
-
                 broadcast_address = str(iface.ip_interface.network.broadcast_address)
-                print(f"[ProtocolHandler] Sending routing update via {iface.name} to {broadcast_address}")
+                info(f"Sending routing update via {iface.name} to {broadcast_address}", tag="ProtocolHandler")
                 self.sock.sendto(full_packet, (broadcast_address, self.protocol_port))
 
     def probe_request(self):
@@ -411,7 +449,7 @@ class ProtocolHandler:
             header = self._create_header(self.PACKET_TYPE_LATENCY_REQUEST)
             full_packet = header + payload_bytes
 
-            print(f"[ProtocolHandler] Sending a probe request #{seq_num} to {neighbor}")
+            info(f"Sending a probe request #{seq_num} to {neighbor}", tag="ProtocolHandler")
             self.sock.sendto(full_packet, (neighbor, self.protocol_port))
 
     def start_packet_loss_test(self, count: int = 10):
@@ -427,7 +465,7 @@ class ProtocolHandler:
                     "destination": neighbor
                 }
 
-            print(f"[ProtocolHandler] Starting packet loss test to {neighbor} (session #{session_id}, {count} packets)")
+            info(f"Starting packet loss test to {neighbor} (session #{session_id}, {count} packets)", tag="ProtocolHandler")
             # O payload do pacote de perda conterá o ID da sessão e o número do pacote na rajada
             for i in range(count):
                 seq_num_in_session = i + 1
@@ -448,19 +486,19 @@ class ProtocolHandler:
                     loss_percent = (loss_count / sent_count) * 100 if sent_count > 0 else 0
                     destination = session['destination']
 
-                    print(f"\n--- Packet loss test result ---\n"
-                          f"Destination: {destination} (session #{session_id})\n"
-                          f"  - Sent:   {sent_count}\n"
-                          f"  - Received:  {received_count}\n"
-                          f"  - Lost:   {loss_count} ({loss_percent:.1f}%)\n"
-                          f"--------------------------------------------")
+                    info(f"\n--- Packet loss test result ---\n"
+                         f"Destination: {destination} (session #{session_id})\n"
+                         f"  - Sent:   {sent_count}\n"
+                         f"  - Received:  {received_count}\n"
+                         f"  - Lost:   {loss_count} ({loss_percent:.1f}%)\n"
+                         f"--------------------------------------------")
 
                     self.neighbor_loss[destination] = loss_percent
                     del self._pending_loss_tests[session_id]
 
     def listen_for_packets(self):
         """Loop principal para escutar pacotes de outros roteadores."""
-        print("[ProtocolHandler] Listening for routing packets...")
+        info("Listening for routing packets...", tag="ProtocolHandler")
         if_map = {index: name for index, name in socket.if_nameindex()}
 
         while True:
@@ -482,17 +520,17 @@ class ProtocolHandler:
                 payload_bytes = data[self.HEADER_SIZE:]
 
                 if version != self.PROTOCOL_VERSION:
-                    print("[ProtocolHandler] Message discarted, unknown version")
+                    warn("Message discarted, unknown version", tag="ProtocolHandler")
                     continue
 
                 if packet_type == self.PACKET_TYPE_UPDATE:
                     self._handle_routing_update(payload_bytes, source_ip, incoming_interface_name)
 
                 elif packet_type == self.PACKET_TYPE_LATENCY_REQUEST:
-                    self._handle_probe_request(payload_bytes, source_ip)
+                    self._handle_latency_request(payload_bytes, source_ip)
 
                 elif packet_type == self.PACKET_TYPE_LATENCY_REPLY:
-                    self._handle_probe_reply(payload_bytes, source_ip)
+                    self._handle_latency_reply(payload_bytes, source_ip)
 
                 elif packet_type == self.PACKET_TYPE_LOSS_REQUEST:
                     self._handle_loss_request(payload_bytes, source_ip)
@@ -501,10 +539,10 @@ class ProtocolHandler:
                     self._handle_loss_reply(payload_bytes, source_ip)
 
                 else:
-                    print(f"[ProtocolHandler] Received unknown packet {packet_type} from {source_ip} via {incoming_interface_name}")
+                    error(f"Received unknown packet {packet_type} from {source_ip} via {incoming_interface_name}", tag="ProtocolHandler")
 
             except OSError as e:
-                print(f"[ProtocolHandler] Socket error: {e}")
+                error(f"Socket error: {e}", tag="ProtocolHandler")
                 break
 
 
@@ -523,10 +561,10 @@ class Router:
 
     def discover_interfaces(self, interface_definitions: List[str]):
         """Processa as definições de interface passadas via argumento de linha de comando."""
-        print("[Router] Configuring interfaces from command line arguments...")
+        info("Configuring interfaces from command line arguments...", tag="Router")
 
         if not interface_definitions:
-            print("[Router] ERROR: No interfaces provided. Exiting.")
+            error("No interfaces provided. Exiting.", tag="Router")
             exit(1)
 
         for iface_def in interface_definitions:
@@ -542,7 +580,7 @@ class Router:
                     state="UP"
                 )
                 self.interfaces.append(iface)
-                print(f"[Router] Configured interface: {name} with IP {iface.ip_interface}")
+                info(f"Configured interface: {name} with IP {iface.ip_interface}", tag="Router")
 
                 # Adiciona a rede diretamente conectada à tabela de roteamento com métrica 0
                 connected_route = RouteEntry(
@@ -555,8 +593,8 @@ class Router:
                 self.routing_table.add_or_update_route(connected_route)
 
             except ValueError:
-                print(f"[Router] ERROR: Malformed interface definition: '{iface_def}'. "
-                      "Expected format: name,ip/prefix. Exiting.")
+                error(f"Malformed interface definition: '{iface_def}'. "
+                      "Expected format: name,ip/prefix. Exiting.", tag="Router")
                 exit(1)
 
     def start(self):
@@ -564,7 +602,7 @@ class Router:
         listener_thread = threading.Thread(target=self.protocol_handler.listen_for_packets, daemon=True)
         listener_thread.start()
 
-        print("[Router] Starting periodic tasks...")
+        info("Starting periodic tasks...", tag="Router")
         while True:
             try:
                 self.routing_table.remove_expired_routes(self.route_timeout)
@@ -573,13 +611,14 @@ class Router:
                 self.protocol_handler.start_packet_loss_test()
                 self.protocol_handler.check_and_report_loss_tests()
 
-                print("\n--- Current Routing Table ---")
-                print(self.routing_table.get_printable_string())
+                if is_info_enabled():
+                    print("\n--- Current Routing Table ---")
+                    print(self.routing_table.get_printable_string())
 
                 time.sleep(self.update_interval)
 
             except KeyboardInterrupt:
-                print("[Router] Shutting down...")
+                info("Shutting down...", tag="Router")
                 self.protocol_handler.sock.close()
                 break
 
@@ -592,6 +631,12 @@ if __name__ == "__main__":
         help="O endereço IP principal que serve como ID único para este roteador."
     )
     parser.add_argument(
+        "--level",
+        help="Nível de log",
+        # choices=list(LOG_LEVELS.keys()),
+        default="info"
+    )
+    parser.add_argument(
         "--interfaces",
         required=True,
         nargs='+',
@@ -601,11 +646,14 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    info(f"Nível de log: {args.level}")
+    LOG_LEVEL = LOG_LEVELS.get(args.level)
+
     try:
         my_router = Router(router_id=args.router_id)
         my_router.discover_interfaces(interface_definitions=args.interfaces)
         my_router.start()
 
     except ipaddress.AddressValueError:
-        print(f"ERRO: O router_id '{args.router_id}' não é um endereço IPv4 válido.")
+        error(f"O router_id '{args.router_id}' não é um endereço IPv4 válido.")
         exit(1)
